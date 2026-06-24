@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# LFV generated data and heavy artifacts
+*.bag
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.html
+*.jpg
+*.jpeg
+*.png
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.pkl
+
+# Runtime output roots
+quality/
+stages/
+processed_topcam/
+rosbag_data/
+data/
+outputs/
+tmp/
+logs/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
