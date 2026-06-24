@@ -1,0 +1,123 @@
+{
+  "semantic": "Strict EgoInfinity component check for LFV hand Phase-C",
+  "egoinfinity_root": "/home/yannan/workspace/EgoInfinity",
+  "checkpoint_dir": "/home/yannan/workspace/EgoInfinity/pretrained_models",
+  "files": {
+    "detector_pt": {
+      "path": "/home/yannan/workspace/EgoInfinity/pretrained_models/detector.pt",
+      "exists": true,
+      "size_bytes": 53582271,
+      "min_size_bytes": 1000000,
+      "ok": true
+    },
+    "wilor_final_ckpt": {
+      "path": "/home/yannan/workspace/EgoInfinity/pretrained_models/wilor_final.ckpt",
+      "exists": true,
+      "size_bytes": 2564989533,
+      "min_size_bytes": 10000000,
+      "ok": true
+    },
+    "infiller_pt": {
+      "path": "/home/yannan/workspace/EgoInfinity/pretrained_models/infiller.pt",
+      "exists": true,
+      "size_bytes": 418603497,
+      "min_size_bytes": 1000000,
+      "ok": true
+    },
+    "sam2_small": {
+      "path": "/home/yannan/workspace/EgoInfinity/pretrained_models/sam2.1_hiera_small.pt",
+      "exists": true,
+      "size_bytes": 184416285,
+      "min_size_bytes": 10000000,
+      "ok": true
+    },
+    "mano_right": {
+      "path": "/home/yannan/workspace/EgoInfinity/third_party/wilor/mano_data/MANO_RIGHT.pkl",
+      "exists": true,
+      "size_bytes": 3821356,
+      "min_size_bytes": 1000000,
+      "ok": true
+    },
+    "mano_mean_params": {
+      "path": "/home/yannan/workspace/EgoInfinity/third_party/wilor/mano_data/mano_mean_params.npz",
+      "exists": true,
+      "size_bytes": 1178,
+      "min_size_bytes": 100,
+      "ok": true
+    },
+    "egoinfinity_wilor_source": {
+      "path": "/home/yannan/workspace/EgoInfinity/third_party/wilor/models/wilor.py",
+      "exists": true,
+      "size_bytes": 17427,
+      "min_size_bytes": 1000,
+      "ok": true
+    }
+  },
+  "imports": {
+    "torch": {
+      "module": "torch",
+      "ok": true,
+      "version": "2.11.0+cu128",
+      "error": ""
+    },
+    "cv2": {
+      "module": "cv2",
+      "ok": true,
+      "version": "4.13.0",
+      "error": ""
+    },
+    "scipy": {
+      "module": "scipy",
+      "ok": true,
+      "version": "1.15.3",
+      "error": ""
+    },
+    "huggingface_hub": {
+      "module": "huggingface_hub",
+      "ok": true,
+      "version": "1.19.0",
+      "error": ""
+    },
+    "memfof": {
+      "module": "memfof",
+      "ok": true,
+      "version": "",
+      "error": ""
+    },
+    "local_depth_align": {
+      "module": "egoinfinity_strict.depth_align",
+      "ok": true,
+      "version": "",
+      "error": ""
+    },
+    "local_depth_stabilize": {
+      "module": "egoinfinity_strict.depth_stabilize",
+      "ok": true,
+      "version": "",
+      "error": ""
+    },
+    "local_biomech": {
+      "module": "egoinfinity_strict.biomech_constraints",
+      "ok": true,
+      "version": "",
+      "error": ""
+    },
+    "local_mano_smoothing": {
+      "module": "egoinfinity_strict.mano_smoothing",
+      "ok": true,
+      "version": "",
+      "error": ""
+    },
+    "local_motion_infiller": {
+      "module": "egoinfinity_strict.motion_infiller",
+      "ok": true,
+      "version": "",
+      "error": ""
+    }
+  },
+  "strict_ready": true,
+  "phase_c_ready_without_flow": true,
+  "sam2_object_tracking_ready": true,
+  "hard_errors": [],
+  "warnings": []
+}

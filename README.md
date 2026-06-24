@@ -26,6 +26,8 @@ large because `joints_uv` has no real observation for those frames.
 ```text
 local_pipelines/
   egoinfinity_hand_pipeline/   Current C3 hand-model pipeline.
+  egoinfinity_hand_alignment_pipeline/
+                                Fork for hand/MANO/depth alignment debugging.
   double_hand_pipeline/        Dual-hand / dual-arm lane wrapper.
   qzy_wilor_fallback/          Previous best single-arm WiLoR fallback pipeline.
 
@@ -105,5 +107,8 @@ python3 local_pipelines/egoinfinity_hand_pipeline/export_phase_c_table_skeleton_
 - Phase-C3 is currently preferred over C4 for skeleton stability.
 - Motion infill is useful, but raw `joints_uv` must not be trusted for infilled
   rows.
+- Alignment experiments should happen in
+  `local_pipelines/egoinfinity_hand_alignment_pipeline/`, leaving the original
+  `egoinfinity_hand_pipeline/` available for gripper-mapping work.
 - Dual-hand arm mapping is explicit. The pipeline does not yet solve high-level
   coordination logic between the two robot arms.
