@@ -245,6 +245,86 @@ The next likely fix is to make Phase-C projection-preserving:
 - reject or downweight depth samples when the per-joint translation spread is
   large, especially large `translation_tz_spread_m`.
 
+## Phase-C Mask-Gated Depth Diagnosis
+
+Added a mask-gated depth diagnostic:
+
+`local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_mask_gated_depth.py`
+
+Purpose:
+
+- Keep WiLoR `joints_uv` as the 2D observation.
+- Build a hand mask from the left-table frame and the WiLoR bbox/joints.
+- Sample FoundationStereo depth only where the joint and local patch are inside
+  the hand mask.
+- Use only reliable joints `[0, 5, 9, 13, 17]` by default.
+- Do not fall back to all 21 joints unless explicitly requested.
+
+Full-video SAM run:
+
+```bash
+cd /home/yannan/workspace/learning-from-video
+/home/yannan/workspace/learning-from-video/.venv-dinosam/bin/python \
+  local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_mask_gated_depth.py \
+  --session-dir /home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001 \
+  --source-pipeline egoinfinity_hand_pipeline \
+  --segmenter sam \
+  --sam-device cuda \
+  --scale 0.50
+```
+
+Outputs:
+
+`/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/quality_check/phase_c_mask_gated_depth_sam/`
+
+Important files:
+
+- `phase_c_mask_gated_depth_summary.json`
+- `phase_c_mask_gated_depth_candidates.csv`
+- `phase_c_mask_gated_selected_frames.jpg`
+- `phase_c_mask_gated_worst_old.jpg`
+- `phase_c_mask_gated_worst_new.jpg`
+
+Full-video result:
+
+| Metric | Current Phase-C | SAM mask-gated reliable joints |
+|---|---:|---:|
+| candidates | 1323 | 1323 |
+| candidates with estimate | 1323 | 1285 |
+| median overlay RMS | 19.54 px | 19.29 px |
+| p90 overlay RMS | 33.89 px | 31.75 px |
+| max overlay RMS | 80.56 px | 60.20 px |
+| median alignment residual | 24.6 mm | 24.1 mm |
+| median sampled-depth z spread | 48.7 mm | 47.7 mm |
+
+Problem-frame range `590-630`:
+
+| Metric | Current Phase-C | SAM mask-gated reliable joints |
+|---|---:|---:|
+| candidates | 53 | 53 |
+| candidates with estimate | 53 | 34 |
+| median overlay RMS | 39.78 px | 50.69 px on estimated subset |
+| median alignment residual | high/mixed | 17.5 mm |
+| median sampled-depth z spread | high/mixed | 26.4 mm |
+
+Interpretation:
+
+1. The hand mask gate correctly rejects weak fallback cases.  All 37 rows that
+   previously used `depth_all_joints` become `mask_reliable_joints_insufficient`.
+   This prevents low-confidence fingertip/table/object depth from entering the
+   later trajectory.
+2. The mask gate alone does not fix the systematic image-space offset.  For
+   normal `depth_reliable_joints` rows, improvements and regressions are roughly
+   balanced.
+3. On the bad `590-630` interval, SAM often finds a hand/forearm mask, but many
+   reliable joints still have `no_masked_depth`.  That means the dominant issue
+   is not only table contamination; FoundationStereo depth around hand/object
+   boundaries is missing or inconsistent, and the MANO scale/depth fit remains
+   underconstrained.
+4. This gate is still useful as a QC/rejection mechanism.  It should be added to
+   Phase-C as an optional switch, but it should not be treated as the main
+   alignment fix.
+
 ## Re-run Command
 
 ```bash

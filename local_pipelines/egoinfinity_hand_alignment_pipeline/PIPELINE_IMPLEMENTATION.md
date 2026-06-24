@@ -270,6 +270,69 @@ Depth stabilization:
 
 Status: implemented.
 
+## Stage C1-Diagnostic: Mask-Gated Depth Sampling
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_mask_gated_depth.py
+```
+
+Purpose:
+
+- Test whether Phase-C depth alignment becomes more stable if FoundationStereo
+  depth is sampled only inside a hand segmentation mask.
+- Keep WiLoR `joints_uv` unchanged.
+- Use SAM, GrabCut, or bbox masks as a gate for depth sampling.
+- By default, use only reliable joints `[0, 5, 9, 13, 17]` and refuse the
+  all-joint fallback.
+
+Example:
+
+```bash
+cd /home/yannan/workspace/learning-from-video
+/home/yannan/workspace/learning-from-video/.venv-dinosam/bin/python \
+  local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_mask_gated_depth.py \
+  --session-dir /home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001 \
+  --source-pipeline egoinfinity_hand_pipeline \
+  --segmenter sam \
+  --sam-device cuda
+```
+
+Outputs:
+
+```text
+quality_check/phase_c_mask_gated_depth_sam/phase_c_mask_gated_depth_summary.json
+quality_check/phase_c_mask_gated_depth_sam/phase_c_mask_gated_depth_candidates.csv
+quality_check/phase_c_mask_gated_depth_sam/phase_c_mask_gated_selected_frames.jpg
+quality_check/phase_c_mask_gated_depth_sam/phase_c_mask_gated_worst_old.jpg
+quality_check/phase_c_mask_gated_depth_sam/phase_c_mask_gated_worst_new.jpg
+```
+
+Current baseline result:
+
+```text
+full video, SAM:
+  old Phase-C median RMS: 19.54 px
+  mask-gated median RMS: 19.29 px
+  old Phase-C p90 RMS: 33.89 px
+  mask-gated p90 RMS: 31.75 px
+  old max RMS: 80.56 px
+  mask-gated max RMS: 60.20 px
+  all 37 depth_all_joints fallback rows are rejected as insufficient reliable mask depth
+
+problem interval 590-630, SAM:
+  candidates: 53
+  candidates with estimate: 34
+  median alignment residual: 17.5 mm
+  median z spread: 26.4 mm
+  median overlay RMS on estimated subset: 50.69 px
+```
+
+Status: implemented as a diagnostic/QC branch only.  It is useful for rejecting
+low-confidence depth fallback rows, but it does not solve the main projection
+offset by itself.
+
 ## Stage C1b: EgoInfinity Depth Smooth
 
 Script:
