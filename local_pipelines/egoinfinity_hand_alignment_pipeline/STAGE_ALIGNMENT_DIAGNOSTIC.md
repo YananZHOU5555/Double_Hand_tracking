@@ -169,6 +169,82 @@ depth-aligned/smoothed camera-frame hand.
    applying the same z correction to every joint is causing MCP/finger drift.
 5. Re-run the stage diagnostic after each change and compare this file's table.
 
+## Phase-C Depth Project Diagnosis
+
+Added a focused diagnostic:
+
+`local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_depth_project.py`
+
+Outputs for the baseline run:
+
+`/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/quality_check/phase_c_depth_project_diagnostic/`
+
+Important files:
+
+- `phase_c_depth_project_diagnostic_summary.json`
+- `phase_c_depth_project_diagnostic_all_candidates.csv`
+- `phase_c_depth_project_selected_frames.jpg`
+- `phase_c_depth_project_worst_frames.jpg`
+- `phase_c_depth_project_2d_tz_fit.csv`
+
+The diagnostic compares four variants:
+
+| Variant | Meaning |
+|---|---|
+| raw WiLoR 2D | original `joints_uv`, used as visual reference |
+| `wilor_foundation` | `joints_3d_rel + cam_t_wilor`, projected with the Foundation/left-table camera |
+| `phase_c` | `joints_cam_depth`, projected with the Foundation/left-table camera |
+| `xy_locked_depth` | keep Phase-C depth `z`, but solve x/y translation from raw `joints_uv` |
+
+Current result:
+
+| Metric | Median | P90 | Notes |
+|---|---:|---:|---|
+| `phase_c_rms_px` | 19.54 px | 33.89 px | current Phase-C offset |
+| `wilor_foundation_rms_px` | 217.98 px | 300.71 px | WiLoR `cam_t` is not directly compatible with Foundation camera |
+| `xy_locked_depth_rms_px` | 18.28 px | 29.42 px | solving x/y helps only a little |
+| `phase_c_minus_xy_locked_rms_px` | 12.97 px | 27.31 px | x/y median translation contributes part of the error |
+| `translation_tx_spread_m` | 0.0125 m | 0.0389 m | per-joint x translation estimates disagree |
+| `translation_ty_spread_m` | 0.0072 m | 0.0176 m | per-joint y translation estimates disagree |
+| `translation_tz_spread_m` | 0.0487 m | 0.0813 m | per-joint sampled depths disagree |
+| `alignment_rms_m` | 0.0246 m | 0.0486 m | depth alignment residual across sampled joints |
+
+The extra 2D-fit check searches the best camera `z` that makes the MANO relative
+skeleton match raw `joints_uv` under the Foundation camera:
+
+| Metric | Median | P10 | P90 |
+|---|---:|---:|---:|
+| Phase-C depth `z` | 0.327 m | 0.217 m | 0.447 m |
+| best 2D-fit `z` | 0.397 m | 0.266 m | 0.657 m |
+| `depth_z / best_2d_z` | 0.812 | 0.549 | 0.985 |
+
+This means Phase-C usually places the MANO hand closer to the camera than the
+raw 2D hand size would imply, so the reprojected hand becomes too large.  Some
+bad frames also have inconsistent sampled depths across joints, for example
+finger joints sampling object/table depth while wrist/MCP samples hand depth.
+
+Current interpretation:
+
+1. WiLoR's original `cam_t` is not in the same projection system as the
+   Foundation/left-table camera, so it cannot be reused directly.
+2. FoundationStereo depth gives a useful metric anchor, but per-joint depth
+   samples are not always mutually consistent.
+3. Phase-C estimates one median translation from those samples.  If sampled
+   depths disagree, the median translation can be pulled away from the raw 2D
+   hand.
+4. Even when x/y is solved from raw 2D after fixing Phase-C `z`, the hand is
+   still offset because the depth `z` is often too close for the raw 2D hand
+   size.
+
+The next likely fix is to make Phase-C projection-preserving:
+
+- keep raw WiLoR `joints_uv` as a 2D constraint for detected frames;
+- use FoundationStereo depth only to estimate/smooth metric `z`;
+- after choosing `z`, recompute x/y from raw `joints_uv` instead of keeping the
+  median x/y translation from depth samples;
+- reject or downweight depth samples when the per-joint translation spread is
+  large, especially large `translation_tz_spread_m`.
+
 ## Re-run Command
 
 ```bash
@@ -180,5 +256,18 @@ cd /home/yannan/workspace/learning-from-video
   --frames 94,212,540,562,563,579,590,591,596,616,619,626 \
   --worst-stage phase_c2_mano_smooth_project \
   --worst-count 12 \
+  --scale 0.50
+```
+
+Phase-C focused command:
+
+```bash
+cd /home/yannan/workspace/learning-from-video
+/home/yannan/miniforge3/envs/wilor_lfv/bin/python \
+  local_pipelines/egoinfinity_hand_alignment_pipeline/diagnose_phase_c_depth_project.py \
+  --session-dir /home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001 \
+  --source-pipeline egoinfinity_hand_pipeline \
+  --frames 94,212,540,562,563,579,590,591,596,616,619,626 \
+  --worst-count 16 \
   --scale 0.50
 ```
