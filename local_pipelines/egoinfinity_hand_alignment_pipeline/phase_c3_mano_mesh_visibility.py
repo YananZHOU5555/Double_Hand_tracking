@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-visible-reliable-joints", type=int, default=2)
     p.add_argument("--zbuffer-pad-px", type=int, default=24)
     p.add_argument("--warn-vertex-visible-ratio", type=float, default=0.18)
+    p.add_argument("--vertices-cam-field", default="vertices_cam_smooth")
+    p.add_argument("--joints-cam-field", default="joints_cam_smooth")
+    p.add_argument("--joints-uv-field", default="joints_uv_smooth_depth_camera")
     return p.parse_args()
 
 
@@ -325,10 +328,13 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     data = load_npz(input_npz)
+    vertices_field = str(args.vertices_cam_field)
+    joints_field = str(args.joints_cam_field)
+    joints_uv_field = str(args.joints_uv_field)
     required = [
         "frame_index", "track_id", "hand_label", "is_right", "hand_rank",
-        "candidate_index", "bbox_xyxy", "faces", "vertices_cam_smooth",
-        "joints_cam_smooth", "joints_uv_smooth_depth_camera",
+        "candidate_index", "bbox_xyxy", "faces", vertices_field,
+        joints_field, joints_uv_field,
     ]
     missing = [key for key in required if key not in data]
     if missing:
@@ -342,9 +348,9 @@ def main() -> int:
     frame_index = np.asarray(data["frame_index"], dtype=np.int32)
     n = int(len(frame_index))
     faces = np.asarray(data["faces"], dtype=np.int32)
-    vertices = np.asarray(data["vertices_cam_smooth"], dtype=np.float32)
-    joints = np.asarray(data["joints_cam_smooth"], dtype=np.float32)
-    joints_uv = np.asarray(data["joints_uv_smooth_depth_camera"], dtype=np.float32)
+    vertices = np.asarray(data[vertices_field], dtype=np.float32)
+    joints = np.asarray(data[joints_field], dtype=np.float32)
+    joints_uv = np.asarray(data[joints_uv_field], dtype=np.float32)
     bbox = np.asarray(data["bbox_xyxy"], dtype=np.float32)
 
     vertex_visible = np.zeros((n, vertices.shape[1]), dtype=np.uint8)
@@ -501,6 +507,9 @@ def main() -> int:
         "joint_visibility_csv": str(joint_csv),
         "candidate_visibility_csv": str(candidate_csv),
         "candidates": n,
+        "vertices_cam_field": vertices_field,
+        "joints_cam_field": joints_field,
+        "joints_uv_field": joints_uv_field,
         "camera": camera,
         "epsilon_m": float(args.epsilon_m),
         "surface_radius_px": int(args.surface_radius_px),
@@ -516,8 +525,8 @@ def main() -> int:
         "joint_mesh_visible_ratio": stats(joint_visible_ratio.reshape(-1)),
         "joint_mesh_surface_margin_m": stats(joint_surface_margin.reshape(-1)),
         "smooth_geometry_finite_ratio": {
-            "vertices_cam_smooth": finite_ratio(vertices),
-            "joints_cam_smooth": finite_ratio(joints),
+            vertices_field: finite_ratio(vertices),
+            joints_field: finite_ratio(joints),
         },
         "hard_errors": hard_errors,
         "warnings": warnings,

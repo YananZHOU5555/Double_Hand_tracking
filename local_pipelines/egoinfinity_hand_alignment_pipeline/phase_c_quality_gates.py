@@ -522,6 +522,11 @@ def check_phase_c2_mano_smoothing(
     qc.metrics["event_counts"] = summary.get("event_counts") or {}
     qc.metrics["input_to_smooth_joint_rms_m"] = summary.get("input_to_smooth_joint_rms_m") or {}
     qc.metrics["smooth_wrist_jump_m"] = summary.get("smooth_wrist_jump_m") or {}
+    qc.metrics["raw_global_rot_jump_deg"] = summary.get("raw_global_rot_jump_deg") or {}
+    qc.metrics["smooth_global_rot_jump_deg"] = summary.get("smooth_global_rot_jump_deg") or {}
+    qc.metrics["global_rot_delta_deg"] = summary.get("global_rot_delta_deg") or {}
+    qc.metrics["orientation_flip_core_candidates"] = int(summary.get("orientation_flip_core_candidates", 0))
+    qc.metrics["orientation_flip_neighbor_candidates"] = int(summary.get("orientation_flip_neighbor_candidates", 0))
     qc.metrics["smooth_joints_finite_ratio"] = safe_float(summary.get("smooth_joints_finite_ratio"), 0.0)
     qc.metrics["smooth_vertices_finite_ratio"] = safe_float(summary.get("smooth_vertices_finite_ratio"), 0.0)
     qc.metrics["biomech_clamped_candidates"] = int(summary.get("biomech_clamped_candidates", 0))

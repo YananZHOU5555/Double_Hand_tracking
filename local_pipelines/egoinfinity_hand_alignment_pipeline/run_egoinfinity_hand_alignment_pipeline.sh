@@ -27,6 +27,7 @@ RUN_PHASE_C_DEPTH_STABILIZE="${RUN_PHASE_C_DEPTH_STABILIZE:-false}"
 RUN_PHASE_C_DEPTH_SMOOTH="${RUN_PHASE_C_DEPTH_SMOOTH:-false}"
 RUN_MOTION_INFILL="${RUN_MOTION_INFILL:-false}"
 RUN_PHASE_C2="${RUN_PHASE_C2:-false}"
+RUN_PHASE_C2B_REPAIR="${RUN_PHASE_C2B_REPAIR:-false}"
 RUN_PHASE_C3="${RUN_PHASE_C3:-false}"
 RUN_VISIBILITY_REALIGN="${RUN_VISIBILITY_REALIGN:-false}"
 REBUILD_DEPTH="${REBUILD_DEPTH:-false}"
@@ -35,6 +36,7 @@ REBUILD_PHASE_C="${REBUILD_PHASE_C:-false}"
 REBUILD_PHASE_C_DEPTH_SMOOTH="${REBUILD_PHASE_C_DEPTH_SMOOTH:-false}"
 REBUILD_MOTION_INFILL="${REBUILD_MOTION_INFILL:-false}"
 REBUILD_PHASE_C2="${REBUILD_PHASE_C2:-false}"
+REBUILD_PHASE_C2B_REPAIR="${REBUILD_PHASE_C2B_REPAIR:-false}"
 REBUILD_PHASE_C3="${REBUILD_PHASE_C3:-false}"
 REBUILD_VISIBILITY_REALIGN="${REBUILD_VISIBILITY_REALIGN:-false}"
 VALID_ITERS="${VALID_ITERS:-16}"
@@ -66,6 +68,12 @@ MOTION_INFILL_DEVICE="${MOTION_INFILL_DEVICE:-cuda}"
 SMOOTH_MANO_WINDOW="${SMOOTH_MANO_WINDOW:-7}"
 SMOOTH_MANO_POLYORDER="${SMOOTH_MANO_POLYORDER:-2}"
 PHASE_C2_MIN_TRACK_FRAMES="${PHASE_C2_MIN_TRACK_FRAMES:-3}"
+PHASE_C2B_BAD_GLOBAL_ROT_DELTA_DEG="${PHASE_C2B_BAD_GLOBAL_ROT_DELTA_DEG:-30.0}"
+PHASE_C2B_BAD_RAW_GLOBAL_ROT_JUMP_DEG="${PHASE_C2B_BAD_RAW_GLOBAL_ROT_JUMP_DEG:-90.0}"
+PHASE_C2B_BAD_SMOOTH_GLOBAL_ROT_JUMP_DEG="${PHASE_C2B_BAD_SMOOTH_GLOBAL_ROT_JUMP_DEG:-90.0}"
+PHASE_C2B_BAD_INFILLED_WRIST_JUMP_M="${PHASE_C2B_BAD_INFILLED_WRIST_JUMP_M:-0.080}"
+PHASE_C2B_NEIGHBOR_WINDOW_FRAMES="${PHASE_C2B_NEIGHBOR_WINDOW_FRAMES:-12}"
+PHASE_C2B_BRIDGE_GOOD_GAP_FRAMES="${PHASE_C2B_BRIDGE_GOOD_GAP_FRAMES:-2}"
 MESH_VISIBILITY_EPSILON_M="${MESH_VISIBILITY_EPSILON_M:-0.010}"
 MESH_VISIBILITY_NEAREST_VERTICES="${MESH_VISIBILITY_NEAREST_VERTICES:-18}"
 MESH_VISIBILITY_RATIO_THRESHOLD="${MESH_VISIBILITY_RATIO_THRESHOLD:-0.25}"
@@ -96,6 +104,7 @@ Env:
   RUN_PHASE_C_DEPTH_SMOOTH=${RUN_PHASE_C_DEPTH_SMOOTH}
   RUN_MOTION_INFILL=${RUN_MOTION_INFILL}
   RUN_PHASE_C2=${RUN_PHASE_C2}
+  RUN_PHASE_C2B_REPAIR=${RUN_PHASE_C2B_REPAIR}
   RUN_PHASE_C3=${RUN_PHASE_C3}
   RUN_VISIBILITY_REALIGN=${RUN_VISIBILITY_REALIGN}
   ALLOW_PARTIAL_QC=${ALLOW_PARTIAL_QC}
@@ -137,18 +146,113 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
   fi
 fi
 
+pipeline_dir="${session_dir}/quality/egoinfinity_hand_alignment_pipeline"
+mkdir -p "${pipeline_dir}"
+timing_jsonl="${pipeline_dir}/pipeline_timing.jsonl"
+timing_summary="${pipeline_dir}/pipeline_timing_summary.json"
+: > "${timing_jsonl}"
+
+timer_now_ns() {
+  date +%s%N
+}
+
+timer_duration_sec() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+print(f"{max(0, end - start) / 1e9:.6f}")
+PY
+}
+
+record_stage_timing() {
+  local stage="$1"
+  local status="$2"
+  local start_ns="$3"
+  local end_ns="$4"
+  local exit_code="${5:-0}"
+  local duration
+  duration="$(timer_duration_sec "${start_ns}" "${end_ns}")"
+  printf '{"stage":"%s","status":"%s","duration_sec":%.6f,"exit_code":%d,"started_ns":%s,"ended_ns":%s}\n' \
+    "${stage}" "${status}" "${duration}" "${exit_code}" "${start_ns}" "${end_ns}" >> "${timing_jsonl}"
+}
+
+record_reuse_stage() {
+  local now
+  now="$(timer_now_ns)"
+  record_stage_timing "$1" "reuse" "${now}" "${now}" 0
+}
+
+record_skip_stage() {
+  local now
+  now="$(timer_now_ns)"
+  record_stage_timing "$1" "skip" "${now}" "${now}" 0
+}
+
+run_stage() {
+  local stage="$1"
+  shift
+  local start_ns end_ns status rc
+  start_ns="$(timer_now_ns)"
+  set +e
+  "$@"
+  rc=$?
+  set -e
+  end_ns="$(timer_now_ns)"
+  if [[ "${rc}" -eq 0 ]]; then
+    status="ok"
+  else
+    status="failed"
+  fi
+  record_stage_timing "${stage}" "${status}" "${start_ns}" "${end_ns}" "${rc}"
+  return "${rc}"
+}
+
+write_timing_summary() {
+  python3 - "${timing_jsonl}" "${timing_summary}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+jsonl = Path(sys.argv[1])
+out = Path(sys.argv[2])
+records = []
+if jsonl.exists():
+    for line in jsonl.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        records.append(json.loads(line))
+total = sum(float(r.get("duration_sec", 0.0)) for r in records if r.get("status") == "ok")
+by_status = {}
+for r in records:
+    by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+out.write_text(json.dumps({
+    "timing_jsonl": str(jsonl),
+    "stage_count": len(records),
+    "total_processed_sec": total,
+    "status_counts": by_status,
+    "stages": records,
+}, indent=2, ensure_ascii=False) + "\n")
+PY
+}
+
+trap 'write_timing_summary >/dev/null 2>&1 || true' EXIT
+
 if [[ ! -f "${session_dir}/processed_topcam/left_table.mp4" ]]; then
   if [[ "${PROCESS_TOPCAM}" == "auto" || "${PROCESS_TOPCAM}" == "true" || "${PROCESS_TOPCAM}" == "1" ]]; then
     echo "[egoinfinity_hand_alignment_pipeline] Missing processed_topcam; generating it from episode_0.bag."
-    HOST_SESSION_ROOT="${HOST_SESSION_ROOT}" OUTPUT_FPS="${TOPCAM_OUTPUT_FPS}" \
+    run_stage "process_topcam" \
+      env HOST_SESSION_ROOT="${HOST_SESSION_ROOT}" OUTPUT_FPS="${TOPCAM_OUTPUT_FPS}" \
       bash "${LFV_ROOT}/scripts/process_lfv_demo_topcam.sh" "${session_dir}"
   else
     echo "[egoinfinity_hand_alignment_pipeline] Missing processed_topcam/left_table.mp4" >&2
     exit 1
   fi
+else
+  record_reuse_stage "process_topcam"
 fi
 
-pipeline_dir="${session_dir}/quality/egoinfinity_hand_alignment_pipeline"
 raw_dir="${pipeline_dir}/stages/raw_wilor_handresults"
 phase_b_dir="${pipeline_dir}/stages/phase_b_track_postprocess"
 depth_dir="${pipeline_dir}/stages/foundationstereo_depth"
@@ -157,9 +261,10 @@ phase_c_dir="${pipeline_dir}/stages/phase_c_depth_align"
 phase_c1b_dir="${pipeline_dir}/stages/phase_c_depth_smooth"
 phase_c1c_dir="${pipeline_dir}/stages/phase_c_motion_infiller"
 phase_c2_dir="${pipeline_dir}/stages/phase_c_mano_smooth"
+phase_c2b_dir="${pipeline_dir}/stages/phase_c2b_bad_pose_repair"
 phase_c3_dir="${pipeline_dir}/stages/phase_c_mesh_visibility"
 phase_c4_dir="${pipeline_dir}/stages/phase_c_visibility_depth_realign"
-mkdir -p "${raw_dir}" "${phase_b_dir}" "${depth_dir}" "${depth_stabilized_dir}" "${phase_c_dir}" "${phase_c1b_dir}" "${phase_c1c_dir}" "${phase_c2_dir}" "${phase_c3_dir}" "${phase_c4_dir}"
+mkdir -p "${raw_dir}" "${phase_b_dir}" "${depth_dir}" "${depth_stabilized_dir}" "${phase_c_dir}" "${phase_c1b_dir}" "${phase_c1c_dir}" "${phase_c2_dir}" "${phase_c2b_dir}" "${phase_c3_dir}" "${phase_c4_dir}"
 
 raw_npz="${raw_dir}/wilor_handresults_raw.npz"
 raw_summary="${raw_dir}/wilor_handresults_raw_summary.json"
@@ -186,6 +291,9 @@ phase_c2_npz="${phase_c2_dir}/wilor_handresults_phase_c2_mano_smooth.npz"
 phase_c2_summary="${phase_c2_dir}/mano_smoothing_summary.json"
 phase_c2_qc_csv="${phase_c2_dir}/mano_smoothing_quality.csv"
 phase_c2_track_csv="${phase_c2_dir}/mano_smoothing_track_summary.csv"
+phase_c2b_npz="${phase_c2b_dir}/wilor_handresults_phase_c2b_bad_pose_repaired.npz"
+phase_c2b_summary="${phase_c2b_dir}/bad_pose_repair_summary.json"
+phase_c2b_qc_csv="${phase_c2b_dir}/bad_pose_repair_quality.csv"
 phase_c3_npz="${phase_c3_dir}/wilor_handresults_phase_c3_mesh_visibility.npz"
 phase_c3_summary="${phase_c3_dir}/mano_mesh_visibility_summary.json"
 phase_c3_joint_csv="${phase_c3_dir}/mano_mesh_visibility_joints.csv"
@@ -203,7 +311,8 @@ if [[ "${REBUILD_EGO_HAND}" == "true" || ! -f "${raw_npz}" || ! -f "${raw_summar
   if [[ "${SAVE_RAW_OVERLAY}" == "true" ]]; then
     overlay_arg+=(--save-overlay)
   fi
-  "${WILOR_PYTHON}" "${SCRIPT_DIR}/export_wilor_handresults.py" \
+  run_stage "raw_wilor_export" \
+    "${WILOR_PYTHON}" "${SCRIPT_DIR}/export_wilor_handresults.py" \
     --session-dir "${session_dir}" \
     --wilor-root "${WILOR_ROOT}" \
     --video "${session_dir}/processed_topcam/left_table.mp4" \
@@ -218,18 +327,22 @@ if [[ "${REBUILD_EGO_HAND}" == "true" || ! -f "${raw_npz}" || ! -f "${raw_summar
     "${overlay_arg[@]}"
 else
   echo "[egoinfinity_hand_alignment_pipeline] reuse ${raw_npz}"
+  record_reuse_stage "raw_wilor_export"
 fi
 
 if [[ "${REBUILD_EGO_HAND}" == "true" || ! -f "${phase_b_npz}" || ! -f "${phase_b_summary}" ]]; then
-  "${WILOR_PYTHON}" "${SCRIPT_DIR}/postprocess_handresults.py" \
+  run_stage "phase_b_track_postprocess" \
+    "${WILOR_PYTHON}" "${SCRIPT_DIR}/postprocess_handresults.py" \
     --input-npz "${raw_npz}" \
     --output-dir "${phase_b_dir}"
 else
   echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_b_npz}"
+  record_reuse_stage "phase_b_track_postprocess"
 fi
 
 mkdir -p "${qa_dir}"
-"${WILOR_PYTHON}" "${SCRIPT_DIR}/quality_check_handresults.py" \
+run_stage "quality_check_handresults" \
+  "${WILOR_PYTHON}" "${SCRIPT_DIR}/quality_check_handresults.py" \
   --raw-npz "${raw_npz}" \
   --phase-b-npz "${phase_b_npz}" \
   --output-dir "${qa_dir}" \
@@ -246,7 +359,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
   fi
   if [[ "${REBUILD_DEPTH}" == "true" || ! -f "${depth_summary}" ]]; then
     echo "[egoinfinity_hand_alignment_pipeline] Running FoundationStereo depth."
-    "${PYTHON_BIN}" "${LFV_ROOT}/scripts/run_lfv_foundationstereo_disparity.py" \
+    run_stage "foundationstereo_depth" \
+      "${PYTHON_BIN}" "${LFV_ROOT}/scripts/run_lfv_foundationstereo_disparity.py" \
       --session-dir "${session_dir}" \
       --output-dir "${depth_dir}" \
       --backend foundationstereo \
@@ -262,6 +376,7 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
       "${preview_args[@]}"
   else
     echo "[egoinfinity_hand_alignment_pipeline] reuse ${depth_summary}"
+    record_reuse_stage "foundationstereo_depth"
   fi
 
   phase_c_depth_summary="${depth_summary}"
@@ -275,7 +390,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     fi
     if [[ "${REBUILD_PHASE_C_DEPTH_STABILIZE}" == "true" || ! -f "${depth_stabilized_summary}" || ! -f "${depth_stabilized_frame_csv}" || "${depth_summary}" -nt "${depth_stabilized_summary}" || "${phase_b_npz}" -nt "${depth_stabilized_summary}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C0b depth stabilization."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c0b_depth_stabilize.py" \
+      run_stage "phase_c0b_depth_stabilize" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c0b_depth_stabilize.py" \
         --session-dir "${session_dir}" \
         --phase-b-npz "${phase_b_npz}" \
         --depth-summary-json "${depth_summary}" \
@@ -286,8 +402,11 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
         "${depth_stabilize_args[@]}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${depth_stabilized_summary}"
+      record_reuse_stage "phase_c0b_depth_stabilize"
     fi
     phase_c_depth_summary="${depth_stabilized_summary}"
+  else
+    record_skip_stage "phase_c0b_depth_stabilize"
   fi
 
   phase_c_args=()
@@ -306,7 +425,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
   fi
   if [[ "${REBUILD_PHASE_C}" == "true" || "${phase_c_input_mismatch}" == "true" || ! -f "${phase_c_npz}" || ! -f "${phase_c_summary}" || "${phase_c_depth_summary}" -nt "${phase_c_npz}" || "${phase_b_npz}" -nt "${phase_c_npz}" ]]; then
     echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C FoundationStereo depth alignment."
-    "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c_foundation_depth_align.py" \
+    run_stage "phase_c_foundation_depth_align" \
+      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c_foundation_depth_align.py" \
       --session-dir "${session_dir}" \
       --input-npz "${phase_b_npz}" \
       --depth-summary-json "${phase_c_depth_summary}" \
@@ -318,6 +438,7 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
       "${phase_c_args[@]}"
   else
     echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c_npz}"
+    record_reuse_stage "phase_c_foundation_depth_align"
   fi
 
   phase_c2_input_npz="${phase_c_npz}"
@@ -335,7 +456,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     fi
     if [[ "${REBUILD_PHASE_C_DEPTH_SMOOTH}" == "true" || "${phase_c1b_input_mismatch}" == "true" || ! -f "${phase_c1b_npz}" || ! -f "${phase_c1b_summary}" || "${phase_c_npz}" -nt "${phase_c1b_npz}" || "${phase_c_depth_summary}" -nt "${phase_c1b_npz}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C1b EgoInfinity depth smoothing."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c1b_depth_smooth.py" \
+      run_stage "phase_c1b_depth_smooth" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c1b_depth_smooth.py" \
         --session-dir "${session_dir}" \
         --input-npz "${phase_c_npz}" \
         --depth-summary-json "${phase_c_depth_summary}" \
@@ -348,8 +470,11 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
         "${depth_smooth_vertex_arg[@]}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c1b_npz}"
+      record_reuse_stage "phase_c1b_depth_smooth"
     fi
     phase_c2_input_npz="${phase_c1b_npz}"
+  else
+    record_skip_stage "phase_c1b_depth_smooth"
   fi
 
   if [[ "${RUN_MOTION_INFILL}" == "true" || "${RUN_MOTION_INFILL}" == "1" ]]; then
@@ -359,7 +484,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     fi
     if [[ "${REBUILD_MOTION_INFILL}" == "true" || "${motion_input_mismatch}" == "true" || ! -f "${phase_c1c_npz}" || ! -f "${phase_c1c_summary}" || "${phase_c2_input_npz}" -nt "${phase_c1c_npz}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C1c EgoInfinity MotionInfiller."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c1c_motion_infiller.py" \
+      run_stage "phase_c1c_motion_infiller" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c1c_motion_infiller.py" \
         --session-dir "${session_dir}" \
         --input-npz "${phase_c2_input_npz}" \
         --output-dir "${phase_c1c_dir}" \
@@ -368,8 +494,11 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
         --device "${MOTION_INFILL_DEVICE}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c1c_npz}"
+      record_reuse_stage "phase_c1c_motion_infiller"
     fi
     phase_c2_input_npz="${phase_c1c_npz}"
+  else
+    record_skip_stage "phase_c1c_motion_infiller"
   fi
 
   if [[ "${RUN_PHASE_C2}" == "true" || "${RUN_PHASE_C2}" == "1" ]]; then
@@ -379,7 +508,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     fi
     if [[ "${REBUILD_PHASE_C2}" == "true" || "${phase_c2_input_mismatch}" == "true" || ! -f "${phase_c2_npz}" || ! -f "${phase_c2_summary}" || "${phase_c2_input_npz}" -nt "${phase_c2_npz}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C2 MANO temporal smoothing."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c2_mano_temporal_smooth.py" \
+      run_stage "phase_c2_mano_temporal_smooth" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c2_mano_temporal_smooth.py" \
         --session-dir "${session_dir}" \
         --input-npz "${phase_c2_input_npz}" \
         --output-dir "${phase_c2_dir}" \
@@ -389,26 +519,69 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
         --min-track-frames "${PHASE_C2_MIN_TRACK_FRAMES}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c2_npz}"
+      record_reuse_stage "phase_c2_mano_temporal_smooth"
     fi
+  else
+    record_skip_stage "phase_c2_mano_temporal_smooth"
+  fi
+
+  phase_c3_input_npz="${phase_c2_npz}"
+  if [[ "${RUN_PHASE_C2B_REPAIR}" == "true" || "${RUN_PHASE_C2B_REPAIR}" == "1" ]]; then
+    if [[ ! -f "${phase_c2_npz}" ]]; then
+      echo "[egoinfinity_hand_alignment_pipeline] Phase-C2b requires Phase-C2 NPZ: ${phase_c2_npz}" >&2
+      exit 1
+    fi
+    phase_c2b_input_mismatch="false"
+    if [[ -f "${phase_c2b_summary}" ]] && ! grep -Fq "\"input_npz\": \"${phase_c2_npz}\"" "${phase_c2b_summary}"; then
+      phase_c2b_input_mismatch="true"
+    fi
+    if [[ "${REBUILD_PHASE_C2B_REPAIR}" == "true" || "${phase_c2b_input_mismatch}" == "true" || ! -f "${phase_c2b_npz}" || ! -f "${phase_c2b_summary}" || "${phase_c2_npz}" -nt "${phase_c2b_npz}" ]]; then
+      echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C2b bad-pose repair."
+      run_stage "phase_c2b_bad_pose_repair" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c2b_bad_pose_repair.py" \
+        --session-dir "${session_dir}" \
+        --input-npz "${phase_c2_npz}" \
+        --output-dir "${phase_c2b_dir}" \
+        --bad-global-rot-delta-deg "${PHASE_C2B_BAD_GLOBAL_ROT_DELTA_DEG}" \
+        --bad-raw-global-rot-jump-deg "${PHASE_C2B_BAD_RAW_GLOBAL_ROT_JUMP_DEG}" \
+        --bad-smooth-global-rot-jump-deg "${PHASE_C2B_BAD_SMOOTH_GLOBAL_ROT_JUMP_DEG}" \
+        --bad-infilled-wrist-jump-m "${PHASE_C2B_BAD_INFILLED_WRIST_JUMP_M}" \
+        --neighbor-window-frames "${PHASE_C2B_NEIGHBOR_WINDOW_FRAMES}" \
+        --bridge-good-gap-frames "${PHASE_C2B_BRIDGE_GOOD_GAP_FRAMES}"
+    else
+      echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c2b_npz}"
+      record_reuse_stage "phase_c2b_bad_pose_repair"
+    fi
+    phase_c3_input_npz="${phase_c2b_npz}"
+  else
+    record_skip_stage "phase_c2b_bad_pose_repair"
   fi
 
   if [[ "${RUN_PHASE_C3}" == "true" || "${RUN_PHASE_C3}" == "1" ]]; then
-    if [[ ! -f "${phase_c2_npz}" ]]; then
-      echo "[egoinfinity_hand_alignment_pipeline] Phase-C3 requires Phase-C2 NPZ: ${phase_c2_npz}" >&2
+    if [[ ! -f "${phase_c3_input_npz}" ]]; then
+      echo "[egoinfinity_hand_alignment_pipeline] Phase-C3 requires input NPZ: ${phase_c3_input_npz}" >&2
       exit 1
     fi
-    if [[ "${REBUILD_PHASE_C3}" == "true" || ! -f "${phase_c3_npz}" || ! -f "${phase_c3_summary}" || "${phase_c2_npz}" -nt "${phase_c3_npz}" ]]; then
+    phase_c3_input_mismatch="false"
+    if [[ -f "${phase_c3_summary}" ]] && ! grep -Fq "\"input_npz\": \"${phase_c3_input_npz}\"" "${phase_c3_summary}"; then
+      phase_c3_input_mismatch="true"
+    fi
+    if [[ "${REBUILD_PHASE_C3}" == "true" || "${phase_c3_input_mismatch}" == "true" || ! -f "${phase_c3_npz}" || ! -f "${phase_c3_summary}" || "${phase_c3_input_npz}" -nt "${phase_c3_npz}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C3 MANO mesh visibility."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c3_mano_mesh_visibility.py" \
+      run_stage "phase_c3_mano_mesh_visibility" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c3_mano_mesh_visibility.py" \
         --session-dir "${session_dir}" \
-        --input-npz "${phase_c2_npz}" \
+        --input-npz "${phase_c3_input_npz}" \
         --output-dir "${phase_c3_dir}" \
         --epsilon-m "${MESH_VISIBILITY_EPSILON_M}" \
         --nearest-vertices "${MESH_VISIBILITY_NEAREST_VERTICES}" \
         --joint-visible-ratio-threshold "${MESH_VISIBILITY_RATIO_THRESHOLD}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c3_npz}"
+      record_reuse_stage "phase_c3_mano_mesh_visibility"
     fi
+  else
+    record_skip_stage "phase_c3_mano_mesh_visibility"
   fi
 
   if [[ "${RUN_VISIBILITY_REALIGN}" == "true" || "${RUN_VISIBILITY_REALIGN}" == "1" ]]; then
@@ -425,7 +598,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     fi
     if [[ "${REBUILD_VISIBILITY_REALIGN}" == "true" || ! -f "${phase_c4_npz}" || ! -f "${phase_c4_summary}" || "${phase_c3_npz}" -nt "${phase_c4_npz}" ]]; then
       echo "[egoinfinity_hand_alignment_pipeline] Running Phase-C4 visibility-aware depth re-align (experimental)."
-      "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c4_visibility_depth_realign.py" \
+      run_stage "phase_c4_visibility_depth_realign" \
+        "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c4_visibility_depth_realign.py" \
         --session-dir "${session_dir}" \
         --input-npz "${phase_c3_npz}" \
         --depth-summary-json "${phase_c_depth_summary}" \
@@ -438,7 +612,10 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
         "${vis_realign_args[@]}"
     else
       echo "[egoinfinity_hand_alignment_pipeline] reuse ${phase_c4_npz}"
+      record_reuse_stage "phase_c4_visibility_depth_realign"
     fi
+  else
+    record_skip_stage "phase_c4_visibility_depth_realign"
   fi
 
   full_qc_args=()
@@ -491,7 +668,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
     )
   fi
 
-  "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c_quality_gates.py" \
+  run_stage "phase_c_quality_gates" \
+    "${WILOR_PYTHON}" "${SCRIPT_DIR}/phase_c_quality_gates.py" \
     --session-dir "${session_dir}" \
     --phase-b-npz "${phase_b_npz}" \
     --foundation-depth-summary "${phase_c_depth_summary}" \
@@ -504,7 +682,8 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
 
   if [[ "${RUN_PHASE_C_BAD_VIZ}" == "true" || "${RUN_PHASE_C_BAD_VIZ}" == "1" ]]; then
     echo "[egoinfinity_hand_alignment_pipeline] Rendering Phase-C bad-frame visualization."
-    "${WILOR_PYTHON}" "${SCRIPT_DIR}/visualize_phase_c_bad_frames.py" \
+    run_stage "phase_c_bad_frame_visualization" \
+      "${WILOR_PYTHON}" "${SCRIPT_DIR}/visualize_phase_c_bad_frames.py" \
       --session-dir "${session_dir}" \
       --phase-c-npz "${phase_c_npz}" \
       --alignment-csv "${phase_c_qc_csv}" \
@@ -512,8 +691,24 @@ if [[ "${RUN_PHASE_C}" == "true" || "${RUN_PHASE_C}" == "1" ]]; then
       --output-dir "${phase_c_bad_viz_dir}" \
       --context-frames "${PHASE_C_BAD_VIZ_CONTEXT}" \
       --max-sheet-frames "${PHASE_C_BAD_VIZ_MAX_SHEET_FRAMES}"
+  else
+    record_skip_stage "phase_c_bad_frame_visualization"
   fi
+else
+  record_skip_stage "foundationstereo_depth"
+  record_skip_stage "phase_c0b_depth_stabilize"
+  record_skip_stage "phase_c_foundation_depth_align"
+  record_skip_stage "phase_c1b_depth_smooth"
+  record_skip_stage "phase_c1c_motion_infiller"
+  record_skip_stage "phase_c2_mano_temporal_smooth"
+  record_skip_stage "phase_c2b_bad_pose_repair"
+  record_skip_stage "phase_c3_mano_mesh_visibility"
+  record_skip_stage "phase_c4_visibility_depth_realign"
+  record_skip_stage "phase_c_quality_gates"
+  record_skip_stage "phase_c_bad_frame_visualization"
 fi
+
+write_timing_summary
 
 cat <<EOF
 
@@ -549,6 +744,9 @@ cat <<EOF
   phase_c2_mano_smooth_summary_json: ${phase_c2_summary}
   phase_c2_mano_smooth_quality_csv: ${phase_c2_qc_csv}
   phase_c2_mano_smooth_track_summary_csv: ${phase_c2_track_csv}
+  phase_c2b_bad_pose_repair_npz: ${phase_c2b_npz}
+  phase_c2b_bad_pose_repair_summary_json: ${phase_c2b_summary}
+  phase_c2b_bad_pose_repair_quality_csv: ${phase_c2b_qc_csv}
   phase_c3_mesh_visibility_npz: ${phase_c3_npz}
   phase_c3_mesh_visibility_summary_json: ${phase_c3_summary}
   phase_c3_mesh_visibility_joint_csv: ${phase_c3_joint_csv}
@@ -559,4 +757,6 @@ cat <<EOF
   phase_c_bad_alignment_overlay_mp4: ${phase_c_bad_viz_dir}/phase_c_bad_alignment_overlay.mp4
   phase_c_bad_alignment_contact_sheet_jpg: ${phase_c_bad_viz_dir}/phase_c_bad_alignment_contact_sheet.jpg
   phase_c_bad_alignment_summary_json: ${phase_c_bad_viz_dir}/phase_c_bad_alignment_viz_summary.json
+  pipeline_timing_jsonl: ${timing_jsonl}
+  pipeline_timing_summary_json: ${timing_summary}
 EOF

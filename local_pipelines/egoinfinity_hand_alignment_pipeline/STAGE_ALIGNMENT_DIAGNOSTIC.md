@@ -82,6 +82,16 @@ Phase-C2 MANO smooth:
 - C2 inherits the C1b depth-projection offset and adds only a small extra
   smoothing delta.
 
+Phase-C2b bad-pose repair:
+
+- Source file: `stages/phase_c2b_bad_pose_repair/wilor_handresults_phase_c2b_bad_pose_repaired.npz`
+- Display field: `joints_uv_smooth_depth_camera`
+- Meaning: optional repair for detected-but-bad MANO pose rows.  It flags
+  orientation flips / large rotation jumps / large infilled wrist jumps, then
+  interpolates MANO pose and camera translation from same-track trusted
+  neighbors and re-runs MANO forward.  It is meant to fix local occlusion spans
+  such as frame `625-629`, not the global Phase-C depth projection offset.
+
 Phase-C3 mesh visibility:
 
 - Source file: `stages/phase_c_mesh_visibility/wilor_handresults_phase_c3_mesh_visibility.npz`
@@ -324,6 +334,249 @@ Interpretation:
 4. This gate is still useful as a QC/rejection mechanism.  It should be added to
    Phase-C as an optional switch, but it should not be treated as the main
    alignment fix.
+
+## Phase-C1a Silhouette XY + Anchor Depth Diagnosis
+
+Added a projection-preserving alignment experiment:
+
+`local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c1a_silhouette_xy_align.py`
+
+Purpose:
+
+- Keep the WiLoR/MANO relative hand pose and shape fixed.
+- Use segmentation-mask overlap to solve camera-frame X/Y translation.
+- Use one robust anchor point plus local masked FoundationStereo depth to solve
+  Z, instead of taking a componentwise median translation over several joints.
+- Downweight the wrist-to-forearm side of the mask because the sleeve/forearm
+  can dominate the projected silhouette area.
+
+Focused run:
+
+```bash
+cd /home/yannan/workspace/learning-from-video
+/home/yannan/workspace/learning-from-video/.venv-dinosam/bin/python \
+  local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c1a_silhouette_xy_align.py \
+  --session-dir /home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001 \
+  --source-pipeline egoinfinity_hand_pipeline \
+  --segmenter sam \
+  --sam-device cuda \
+  --process-frames 590-630 \
+  --frames 590-630 \
+  --xy-search-px 30 \
+  --xy-step-px 8 \
+  --xy-refine-px 8 \
+  --xy-refine-step-px 2 \
+  --scale 0.70
+```
+
+Outputs:
+
+`/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/quality_check/phase_c1a_silhouette_xy_align/`
+
+Important files:
+
+- `wilor_handresults_phase_c1a_silhouette_xy_aligned.npz`
+- `phase_c1a_silhouette_xy_align_summary.json`
+- `phase_c1a_silhouette_xy_align_candidates.csv`
+- `phase_c1a_silhouette_selected_frames.jpg`
+- `phase_c1a_silhouette_worst_new.jpg`
+- `phase_c1a_silhouette_best_improve.jpg`
+- `phase_c1a_silhouette_table_skeleton_590_630.html`
+- `phase_c1a_silhouette_overlay_590_630.mp4`
+
+Problem-frame range `590-630`:
+
+| Metric | Current Phase-C | Silhouette XY + anchor depth |
+|---|---:|---:|
+| candidates | 53 | 53 |
+| median overlay RMS | 39.78 px | 40.86 px |
+| mean overlay RMS | 40.75 px | 37.82 px |
+| p90 overlay RMS | 55.98 px | 44.24 px |
+| max overlay RMS | 60.20 px | 53.02 px |
+| median mask score | 0.722 | 0.854 |
+
+Grouped observations:
+
+- Left-hand track 0 improves overall: median RMS `44.75 -> 41.97 px`.
+- Right-hand track 8 slightly worsens: median RMS `15.11 -> 18.14 px`.
+- `middle_mcp` and `palm_center` anchors are usually better than `index_mcp`.
+- The method reduces large failures, but can hurt frames where WiLoR already
+  projected cleanly.
+
+Interpretation:
+
+This validates the idea that the main offset is caused by the depth-projection
+translation stage, not MANO pose itself.  However, the current silhouette
+objective is still too dependent on segmentation quality.  SAM frequently
+includes forearm/sleeve and sometimes object-contact regions.  Therefore this
+stage is a useful diagnostic and possible future alignment path, but should stay
+off the main gripper-mapping pipeline until the hand-only mask and anchor policy
+are stronger.
+
+## Anchor-Locked Patch2 Depth Smooth
+
+Implemented as:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c2_anchor_locked_depth_patch2.py
+```
+
+This is the strict version of the current alignment idea:
+
+- Do not run silhouette search.
+- Choose one raw WiLoR 2D anchor by the fixed priority
+  `palm_center -> middle_mcp -> wrist -> index_mcp -> ring_mcp -> pinky_mcp`.
+- Sample FoundationStereo depth at that anchor using a `2px` radius, `5x5`
+  SAM-mask-gated patch.
+- Move the C2 MANO hand so the same semantic MANO anchor lands on that raw
+  2D anchor at the sampled depth.
+- Smooth the selected anchor depth per `(hand_label, track_id)` and recompute
+  camera-frame translation so the raw 2D anchor remains locked.
+- Rows marked `motion_infilled=1` are now skipped by this anchor-lock stage.
+  These rows do not have a trustworthy observed 2D anchor, so re-sampling
+  FoundationStereo depth around their predicted landmarks can create very large
+  jumps.
+- Anchor-lock candidates with projected 2D skeleton RMS above `120 px` are
+  rejected and kept at the incoming C2 geometry.
+
+Output for `bag_20260622_1548_001`:
+
+```text
+/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/stages/phase_c2_anchor_locked_depth_patch2/
+```
+
+Key files:
+
+```text
+wilor_handresults_phase_c2_anchor_locked_depth_patch2_smooth.npz
+phase_c2_anchor_locked_depth_patch2_quality.csv
+phase_c2_anchor_locked_depth_patch2_track_summary.csv
+phase_c2_anchor_locked_depth_patch2_summary.json
+phase_c2_anchor_locked_depth_patch2_overlay.mp4
+phase_c2_anchor_locked_depth_patch2_contact.jpg
+```
+
+Current full-video result:
+
+| Metric | Value |
+|---|---:|
+| candidates | 1379 |
+| smooth ok | 1296 |
+| temporal outlier | 20 |
+| no valid anchor depth | 7 |
+| motion-infilled skipped | 56 |
+| orig RMS median | 31.97 px |
+| anchor-locked smooth RMS median | 20.35 px |
+| before wrist-Z jump median | 2.8 mm |
+| after wrist-Z jump median | 1.4 mm |
+| before wrist-Z jump p90 | 11.0 mm |
+| after wrist-Z jump p90 | 6.6 mm |
+
+The `625-629` bag-occlusion segment still has correct depth-lock execution but
+does not become geometrically correct, because its dominant failure is MANO
+orientation/pose under occlusion.  That segment should be handled by
+MotionInfiller or explicit pose-window replacement next.
+
+## Anchor-Locked C3/C4 Completion
+
+After Stage C2a, the remaining visibility stages were run on the anchor-locked
+geometry rather than the old C2 geometry.
+
+Stage C3 command used the field selection:
+
+```text
+vertices_cam_anchor_locked_smooth
+joints_cam_anchor_locked_smooth
+joints_uv_anchor_locked_smooth
+```
+
+Output:
+
+```text
+/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/stages/phase_c3_mesh_visibility_anchor_locked_patch2/
+```
+
+Result:
+
+| Metric | Value |
+|---|---:|
+| candidates | 1379 |
+| ok | 690 |
+| visible joint count median | 11 |
+| visible reliable joint count median | 2 |
+| bad visibility flags | 588 |
+| warn visibility flags | 289 |
+
+Stage C4 then used:
+
+```text
+cam_t_anchor_locked_smooth
+joints_3d_rel_smooth
+vertices_rel_smooth
+joints_uv_anchor_locked_smooth
+```
+
+Output:
+
+```text
+/home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001/quality/egoinfinity_hand_alignment_pipeline/stages/phase_c4_visibility_depth_realign_anchor_locked_patch2/
+```
+
+Result:
+
+| Metric | Value |
+|---|---:|
+| candidates | 1379 |
+| ok QC | 922 |
+| bad flags | 77 |
+| warn flags | 193 |
+| keep previous total | 263 |
+| rejected bad RMS | 76 |
+| median delta | 15.9 mm |
+| p95 delta | 53.0 mm |
+
+Interpretation:
+
+The C3/C4 branch now runs to completion on the new anchor-locked geometry.  C4
+still moves the hand by a nontrivial amount and should remain experimental until
+its overlay/table-frame output is checked.  The safer current hand-position
+baseline is still Stage C2a.
+
+## Wrist Flip Occlusion Flag
+
+Frame range `625-629` has a separate problem from depth projection: the right
+hand enters the bag and WiLoR/MANO wrist orientation flips under severe
+occlusion.
+
+Implemented in:
+
+`local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c2_mano_temporal_smooth.py`
+
+Signals:
+
+- `mano_raw_global_rot_jump_deg`: frame-to-frame jump of raw WiLoR MANO
+  `global_orient` inside one physical track.
+- `mano_smooth_global_rot_jump_deg`: frame-to-frame jump after temporal
+  smoothing/MANO forward.
+- `mano_global_rot_delta_deg`: how much the smoothed global orientation differs
+  from raw WiLoR for that candidate.
+- `mano_orientation_flip_core`: hard occlusion/flip candidate.
+- `mano_orientation_flip_neighbor`: same-track candidate within the configured
+  neighbor frame window of a core flip.
+
+Test result on `bag_20260622_1548_001` using the C1c MotionInfiller input:
+
+| Frame | Hand | Result |
+|---:|---|---|
+| 625 | right | `bad_global_rot_delta`, core flip |
+| 626 | right | `bad_raw_global_rot_jump`, core flip |
+| 627 | right | neighbor warning |
+| 628 | right | `warn_global_rot_delta` + neighbor warning |
+| 629 | right | `bad_global_rot_delta` + `bad_raw_global_rot_jump`, core flip |
+
+Boundary frames `624` and `630` are marked as neighbor warnings only.  This keeps
+the exact flip frames bad while allowing downstream stages to decide whether to
+drop or downweight the whole occlusion window.
 
 ## Re-run Command
 

@@ -54,6 +54,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bad-input-joint-rms-m", type=float, default=0.120)
     p.add_argument("--warn-smooth-wrist-jump-m", type=float, default=0.090)
     p.add_argument("--bad-smooth-wrist-jump-m", type=float, default=0.160)
+    p.add_argument(
+        "--warn-global-rot-delta-deg",
+        type=float,
+        default=30.0,
+        help="Warn when smoothing changes MANO global wrist orientation by more than this many degrees.",
+    )
+    p.add_argument(
+        "--bad-global-rot-delta-deg",
+        type=float,
+        default=45.0,
+        help="Flag likely occlusion/wrist-flip frames when smoothing changes MANO global wrist orientation by more than this many degrees.",
+    )
+    p.add_argument(
+        "--warn-raw-global-rot-jump-deg",
+        type=float,
+        default=60.0,
+        help="Warn on frame-to-frame raw WiLoR MANO global wrist orientation jumps above this threshold.",
+    )
+    p.add_argument(
+        "--bad-raw-global-rot-jump-deg",
+        type=float,
+        default=100.0,
+        help="Flag likely occlusion/wrist-flip frames on raw frame-to-frame MANO global wrist orientation jumps above this threshold.",
+    )
+    p.add_argument(
+        "--orientation-flip-neighbor-frames",
+        type=int,
+        default=1,
+        help="Also warn candidates from the same track within this many frames of a bad wrist-orientation flip.",
+    )
     return p.parse_args()
 
 
@@ -184,6 +214,16 @@ def frame_to_frame_jump(points: np.ndarray) -> np.ndarray:
     return out
 
 
+def frame_to_frame_rot_jump_deg(rotmats: np.ndarray) -> np.ndarray:
+    mats = np.asarray(rotmats, dtype=np.float64)
+    if len(mats) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    out = np.full((len(mats),), np.nan, dtype=np.float32)
+    if len(mats) > 1:
+        out[1:] = rotation_delta_deg(mats[:-1], mats[1:]).astype(np.float32)
+    return out
+
+
 def project_points(points: np.ndarray, camera_json: str) -> np.ndarray:
     if not camera_json:
         return np.full((*points.shape[:-1], 2), np.nan, dtype=np.float32)
@@ -210,6 +250,8 @@ def write_candidate_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         "input_to_smooth_joint_rms_m", "input_to_smooth_wrist_delta_m",
         "raw_wrist_jump_m", "smooth_wrist_jump_m",
         "raw_vertex_centroid_jump_m", "smooth_vertex_centroid_jump_m",
+        "raw_global_rot_jump_deg", "smooth_global_rot_jump_deg",
+        "orientation_flip_core", "orientation_flip_neighbor",
         "global_rot_delta_deg", "hand_rot_delta_deg_mean", "hand_rot_delta_deg_max",
         "smooth_finite_ratio", "qc_flag",
     ]
@@ -229,6 +271,7 @@ def write_track_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         "input_to_smooth_joint_rms_m_p95", "raw_wrist_jump_m_p95",
         "smooth_wrist_jump_m_p95", "raw_vertex_centroid_jump_m_p95",
         "smooth_vertex_centroid_jump_m_p95",
+        "raw_global_rot_jump_deg_p95", "smooth_global_rot_jump_deg_p95",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -243,6 +286,10 @@ def quality_flag(
     smooth_jump: float,
     finite: float,
     status: str,
+    global_rot_delta_deg: float,
+    raw_global_rot_jump_deg: float,
+    smooth_global_rot_jump_deg: float,
+    near_orientation_flip: bool,
     args: argparse.Namespace,
 ) -> str:
     flags: List[str] = []
@@ -260,6 +307,29 @@ def quality_flag(
             flags.append("bad_smooth_wrist_jump")
         elif smooth_jump > float(args.warn_smooth_wrist_jump_m):
             flags.append("warn_smooth_wrist_jump")
+    bad_orientation_flip = False
+    if math.isfinite(global_rot_delta_deg):
+        if global_rot_delta_deg > float(args.bad_global_rot_delta_deg):
+            flags.append("bad_global_rot_delta")
+            bad_orientation_flip = True
+        elif global_rot_delta_deg > float(args.warn_global_rot_delta_deg):
+            flags.append("warn_global_rot_delta")
+    if math.isfinite(raw_global_rot_jump_deg):
+        if raw_global_rot_jump_deg > float(args.bad_raw_global_rot_jump_deg):
+            flags.append("bad_raw_global_rot_jump")
+            bad_orientation_flip = True
+        elif raw_global_rot_jump_deg > float(args.warn_raw_global_rot_jump_deg):
+            flags.append("warn_raw_global_rot_jump")
+    if math.isfinite(smooth_global_rot_jump_deg):
+        if smooth_global_rot_jump_deg > float(args.bad_raw_global_rot_jump_deg):
+            flags.append("bad_smooth_global_rot_jump")
+            bad_orientation_flip = True
+        elif smooth_global_rot_jump_deg > float(args.warn_raw_global_rot_jump_deg):
+            flags.append("warn_smooth_global_rot_jump")
+    if bad_orientation_flip:
+        flags.append("bad_wrist_orientation_flip_occlusion_suspect")
+    elif near_orientation_flip:
+        flags.append("warn_near_wrist_orientation_flip_occlusion_suspect")
     return "|".join(flags) if flags else "ok"
 
 
@@ -320,6 +390,8 @@ def main() -> int:
     smooth_wrist_jump = np.full((n,), np.nan, dtype=np.float32)
     raw_vertex_centroid_jump = np.full((n,), np.nan, dtype=np.float32)
     smooth_vertex_centroid_jump = np.full((n,), np.nan, dtype=np.float32)
+    raw_global_rot_jump = np.full((n,), np.nan, dtype=np.float32)
+    smooth_global_rot_jump = np.full((n,), np.nan, dtype=np.float32)
     global_delta = np.full((n,), np.nan, dtype=np.float32)
     hand_delta_mean = np.full((n,), np.nan, dtype=np.float32)
     hand_delta_max = np.full((n,), np.nan, dtype=np.float32)
@@ -421,6 +493,8 @@ def main() -> int:
         smooth_centroid = np.nanmean(verts_track, axis=1)
         raw_centroid_j = frame_to_frame_jump(raw_centroid)
         smooth_centroid_j = frame_to_frame_jump(smooth_centroid)
+        raw_global_rot_j = frame_to_frame_rot_jump_deg(go_raw[indices, 0])
+        smooth_global_rot_j = frame_to_frame_rot_jump_deg(go_track_rot[:, 0])
 
         go_delta_track = rotation_delta_deg(go_raw[indices, 0], go_track_rot[:, 0]).astype(np.float32)
         hp_delta_track = rotation_delta_deg(hp_raw[indices], hp_track_rot).astype(np.float32)
@@ -442,6 +516,8 @@ def main() -> int:
             smooth_wrist_jump[i] = smooth_wrist_j[t]
             raw_vertex_centroid_jump[i] = raw_centroid_j[t]
             smooth_vertex_centroid_jump[i] = smooth_centroid_j[t]
+            raw_global_rot_jump[i] = raw_global_rot_j[t]
+            smooth_global_rot_jump[i] = smooth_global_rot_j[t]
             global_delta[i] = go_delta_track[t]
             hand_delta_mean[i] = float(np.nanmean(hp_delta_track[t]))
             hand_delta_max[i] = float(np.nanmax(hp_delta_track[t]))
@@ -470,8 +546,30 @@ def main() -> int:
                 "smooth_wrist_jump_m_p95": csv_float(float(np.nanpercentile(smooth_wrist_j, 95))),
                 "raw_vertex_centroid_jump_m_p95": csv_float(float(np.nanpercentile(raw_centroid_j, 95))),
                 "smooth_vertex_centroid_jump_m_p95": csv_float(float(np.nanpercentile(smooth_centroid_j, 95))),
+                "raw_global_rot_jump_deg_p95": csv_float(float(np.nanpercentile(raw_global_rot_j, 95))),
+                "smooth_global_rot_jump_deg_p95": csv_float(float(np.nanpercentile(smooth_global_rot_j, 95))),
             }
         )
+
+    orientation_flip_core = (
+        (np.isfinite(global_delta) & (global_delta > float(args.bad_global_rot_delta_deg)))
+        | (np.isfinite(raw_global_rot_jump) & (raw_global_rot_jump > float(args.bad_raw_global_rot_jump_deg)))
+        | (np.isfinite(smooth_global_rot_jump) & (smooth_global_rot_jump > float(args.bad_raw_global_rot_jump_deg)))
+    )
+    orientation_flip_neighbor = np.zeros((n,), dtype=bool)
+    neighbor_frames = max(0, int(args.orientation_flip_neighbor_frames))
+    if neighbor_frames > 0:
+        for indices_unsorted in indices_by_track.values():
+            indices = sorted(indices_unsorted, key=lambda i: (int(frame_index[i]), int(data["candidate_index"][i])))
+            core_indices = [i for i in indices if bool(orientation_flip_core[i])]
+            if not core_indices:
+                continue
+            core_frames = np.asarray([int(frame_index[i]) for i in core_indices], dtype=np.int32)
+            for i in indices:
+                if bool(orientation_flip_core[i]):
+                    continue
+                if np.any(np.abs(core_frames - int(frame_index[i])) <= neighbor_frames):
+                    orientation_flip_neighbor[i] = True
 
     qc_flags: List[str] = []
     for i in range(n):
@@ -480,6 +578,10 @@ def main() -> int:
             float(smooth_wrist_jump[i]),
             float(smooth_finite[i]),
             status[i],
+            float(global_delta[i]),
+            float(raw_global_rot_jump[i]),
+            float(smooth_global_rot_jump[i]),
+            bool(orientation_flip_neighbor[i]),
             args,
         )
         qc_flags.append(flag)
@@ -499,6 +601,10 @@ def main() -> int:
                 "smooth_wrist_jump_m": csv_float(float(smooth_wrist_jump[i])),
                 "raw_vertex_centroid_jump_m": csv_float(float(raw_vertex_centroid_jump[i])),
                 "smooth_vertex_centroid_jump_m": csv_float(float(smooth_vertex_centroid_jump[i])),
+                "raw_global_rot_jump_deg": csv_float(float(raw_global_rot_jump[i])),
+                "smooth_global_rot_jump_deg": csv_float(float(smooth_global_rot_jump[i])),
+                "orientation_flip_core": int(bool(orientation_flip_core[i])),
+                "orientation_flip_neighbor": int(bool(orientation_flip_neighbor[i])),
                 "global_rot_delta_deg": csv_float(float(global_delta[i])),
                 "hand_rot_delta_deg_mean": csv_float(float(hand_delta_mean[i])),
                 "hand_rot_delta_deg_max": csv_float(float(hand_delta_max[i])),
@@ -534,6 +640,10 @@ def main() -> int:
     out["mano_input_to_smooth_wrist_delta_m"] = input_to_smooth_wrist_delta.astype(np.float32)
     out["mano_raw_wrist_jump_m"] = raw_wrist_jump.astype(np.float32)
     out["mano_smooth_wrist_jump_m"] = smooth_wrist_jump.astype(np.float32)
+    out["mano_raw_global_rot_jump_deg"] = raw_global_rot_jump.astype(np.float32)
+    out["mano_smooth_global_rot_jump_deg"] = smooth_global_rot_jump.astype(np.float32)
+    out["mano_orientation_flip_core"] = orientation_flip_core.astype(np.int32)
+    out["mano_orientation_flip_neighbor"] = orientation_flip_neighbor.astype(np.int32)
     out["mano_global_rot_delta_deg"] = global_delta.astype(np.float32)
     out["mano_hand_rot_delta_deg_mean"] = hand_delta_mean.astype(np.float32)
     out["mano_hand_rot_delta_deg_max"] = hand_delta_max.astype(np.float32)
@@ -579,6 +689,10 @@ def main() -> int:
         "smooth_wrist_jump_m": stats(smooth_wrist_jump),
         "raw_vertex_centroid_jump_m": stats(raw_vertex_centroid_jump),
         "smooth_vertex_centroid_jump_m": stats(smooth_vertex_centroid_jump),
+        "raw_global_rot_jump_deg": stats(raw_global_rot_jump),
+        "smooth_global_rot_jump_deg": stats(smooth_global_rot_jump),
+        "orientation_flip_core_candidates": int(np.sum(orientation_flip_core)),
+        "orientation_flip_neighbor_candidates": int(np.sum(orientation_flip_neighbor)),
         "global_rot_delta_deg": stats(global_delta),
         "hand_rot_delta_deg_mean": stats(hand_delta_mean),
         "hand_rot_delta_deg_max": stats(hand_delta_max),

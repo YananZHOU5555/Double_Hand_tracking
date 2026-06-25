@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warn-delta-m", type=float, default=0.080)
     p.add_argument("--bad-delta-m", type=float, default=0.160)
     p.add_argument("--keep-previous-on-bad-rms", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cam-t-field", default="cam_t_smooth")
+    p.add_argument("--joints-rel-field", default="joints_3d_rel_smooth")
+    p.add_argument("--vertices-rel-field", default="vertices_rel_smooth")
+    p.add_argument("--joints-uv-field", default="joints_uv_smooth_depth_camera")
     return p.parse_args()
 
 
@@ -263,10 +267,14 @@ def main() -> int:
     cx, cy = float(camera["cx"]), float(camera["cy"])
     half = max(0, int(args.patch_size) // 2)
 
+    cam_t_field = str(args.cam_t_field)
+    joints_rel_field = str(args.joints_rel_field)
+    vertices_rel_field = str(args.vertices_rel_field)
+    joints_uv_field = str(args.joints_uv_field)
     required = [
         "frame_index", "track_id", "hand_label", "is_right", "candidate_index",
-        "cam_t_smooth", "joints_3d_rel_smooth", "vertices_rel_smooth",
-        "joints_uv_smooth_depth_camera", "mano_joint_visible",
+        cam_t_field, joints_rel_field, vertices_rel_field,
+        joints_uv_field, "mano_joint_visible",
         "mano_visible_reliable_joint_count", "mano_visible_joint_count",
     ]
     missing = [key for key in required if key not in data]
@@ -275,10 +283,10 @@ def main() -> int:
 
     frame_index = np.asarray(data["frame_index"], dtype=np.int32)
     n = int(len(frame_index))
-    cam_t_prev = np.asarray(data["cam_t_smooth"], dtype=np.float32)
-    joints_rel = np.asarray(data["joints_3d_rel_smooth"], dtype=np.float32)
-    verts_rel = np.asarray(data["vertices_rel_smooth"], dtype=np.float32)
-    joints_uv = np.asarray(data["joints_uv_smooth_depth_camera"], dtype=np.float32)
+    cam_t_prev = np.asarray(data[cam_t_field], dtype=np.float32)
+    joints_rel = np.asarray(data[joints_rel_field], dtype=np.float32)
+    verts_rel = np.asarray(data[vertices_rel_field], dtype=np.float32)
+    joints_uv = np.asarray(data[joints_uv_field], dtype=np.float32)
     visible = np.asarray(data["mano_joint_visible"], dtype=np.uint8)
 
     cam_t_candidate = cam_t_prev.copy()
@@ -434,6 +442,10 @@ def main() -> int:
         "output_npz": str(output_npz),
         "quality_csv": str(quality_csv),
         "candidates": n,
+        "cam_t_field": cam_t_field,
+        "joints_rel_field": joints_rel_field,
+        "vertices_rel_field": vertices_rel_field,
+        "joints_uv_field": joints_uv_field,
         "enabled_by_default": False,
         "keep_previous_on_bad_rms": bool(args.keep_previous_on_bad_rms),
         "enable_all_visible_fallback": bool(args.enable_all_visible_fallback),

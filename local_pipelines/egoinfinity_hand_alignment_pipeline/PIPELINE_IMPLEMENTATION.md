@@ -27,6 +27,18 @@ Output root:
 <demo>/quality/egoinfinity_hand_alignment_pipeline/
 ```
 
+Every runner invocation also writes stage timing:
+
+```text
+pipeline_timing.jsonl
+pipeline_timing_summary.json
+```
+
+The JSONL file has one record per stage with `stage`, `status`, `duration_sec`,
+and `exit_code`.  Status is one of `ok`, `reuse`, `skip`, or `failed`.  The
+summary JSON aggregates the same records and is also written on failure through
+the runner exit trap.
+
 ## Stage A: Processed Topcam Preflight
 
 Input:
@@ -333,6 +345,87 @@ Status: implemented as a diagnostic/QC branch only.  It is useful for rejecting
 low-confidence depth fallback rows, but it does not solve the main projection
 offset by itself.
 
+## Stage C1a-Diagnostic: Silhouette XY + Anchor Depth
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c1a_silhouette_xy_align.py
+```
+
+Purpose:
+
+- Test a projection-preserving alternative to Stage C1 sparse multi-joint
+  translation.
+- Keep WiLoR/MANO pose, shape, and root-relative hand mesh fixed.
+- Estimate camera-frame X/Y by searching for the MANO projected silhouette that
+  overlaps the hand segmentation mask.
+- Downweight the forearm side below the wrist so the optimizer is biased toward
+  palm/finger overlap instead of sleeve/arm overlap.
+- Estimate Z from one robust semantic anchor and a local masked FoundationStereo
+  depth patch.  Candidate anchors are palm center, wrist, and MCP joints.
+- Keep this as a diagnostic branch because mask quality can pull the hand away
+  from the raw WiLoR 2D joints.
+
+Outputs:
+
+```text
+quality_check/phase_c1a_silhouette_xy_align/wilor_handresults_phase_c1a_silhouette_xy_aligned.npz
+quality_check/phase_c1a_silhouette_xy_align/phase_c1a_silhouette_xy_align_candidates.csv
+quality_check/phase_c1a_silhouette_xy_align/phase_c1a_silhouette_xy_align_summary.json
+quality_check/phase_c1a_silhouette_xy_align/phase_c1a_silhouette_selected_frames.jpg
+quality_check/phase_c1a_silhouette_xy_align/phase_c1a_silhouette_worst_new.jpg
+quality_check/phase_c1a_silhouette_xy_align/phase_c1a_silhouette_best_improve.jpg
+```
+
+Important fields:
+
+```text
+cam_t_silhouette
+joints_cam_silhouette
+vertices_cam_silhouette
+joints_uv_silhouette
+silhouette_status
+silhouette_anchor_name
+silhouette_mask_score
+silhouette_mask_coverage
+silhouette_mask_precision
+silhouette_anchor_depth_m
+```
+
+Problem-interval test result on `bag_20260622_1548_001`, frames `590-630`,
+SAM masks:
+
+```text
+candidates: 53
+status: 29 ok, 24 ok_depth_refine_failed
+old Phase-C median RMS: 39.78 px
+silhouette median RMS: 40.86 px
+old Phase-C p90 RMS: 55.98 px
+silhouette p90 RMS: 44.24 px
+old max RMS: 60.20 px
+silhouette max RMS: 53.02 px
+old mask score median: 0.722
+silhouette mask score median: 0.854
+```
+
+Interpretation:
+
+- This method reduces the worst projection outliers and improves silhouette
+  overlap.
+- It does not yet improve the median frame, and it slightly hurts some right-hand
+  frames where the original WiLoR 2D projection was already good.
+- `ok_depth_refine_failed` means the second anchor-depth sample after the XY
+  move failed the local mask/depth consistency checks, so the stage kept the
+  first anchor depth.
+- The dominant remaining issue is segmentation quality: SAM often includes
+  forearm/sleeve, so silhouette overlap can chase the wrong region even with
+  wrist-below-forearm downweighting.
+
+Status: implemented as an experimental diagnostic node only.  Do not make it a
+main pipeline stage until visual review shows it improves both 2D overlay and
+table-frame 3D skeleton.
+
 ## Stage C1b: EgoInfinity Depth Smooth
 
 Script:
@@ -509,6 +602,8 @@ Purpose:
 - Apply EgoInfinity strict biomechanical clamp.
 - Use per-track median `betas`.
 - Re-run MANO forward to generate a new smooth mesh and joints.
+- Flag occlusion-related wrist orientation flips using raw frame-to-frame MANO
+  global-orientation jumps and raw-to-smoothed global-orientation deltas.
 
 This is not a mesh-translation approximation.
 
@@ -535,6 +630,11 @@ betas_smooth
 joints_uv_smooth_depth_camera
 mano_smoothing_status
 mano_smoothing_qc_flag
+mano_raw_global_rot_jump_deg
+mano_smooth_global_rot_jump_deg
+mano_global_rot_delta_deg
+mano_orientation_flip_core
+mano_orientation_flip_neighbor
 ```
 
 Current baseline result on `bag_20260622_1548_001`:
@@ -545,7 +645,11 @@ tracks: 3
 hard_errors: 0
 smooth_joints_finite_ratio: 1.0
 smooth_vertices_finite_ratio: 1.0
-qc after C1b + C1c input: 1377 ok, 1 warn_smooth_wrist_jump, 1 bad_smooth_wrist_jump
+orientation flip test: 3 core candidates, 4 neighbor candidates
+problem range: frame 625/626/629 right hand are core bad; frame 627/628 are
+  in or near the occlusion interval; frame 624/630 are boundary neighbor warn.
+qc after C1b + C1c input: mostly ok, with wrist-orientation flip warnings/bad
+  flags isolated to a small number of candidates.
 ```
 
 Note: all candidates currently trigger biomech clamp. This may mean the strict
@@ -553,6 +657,61 @@ joint limits are too aggressive for the raw WiLoR rotations, so this needs visua
 review before treating clamp as a quality improvement.
 
 Status: implemented.
+
+## Stage C2b: Bad-Pose Repair
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c2b_bad_pose_repair.py
+```
+
+Enabled by:
+
+```bash
+RUN_PHASE_C2B_REPAIR=true
+```
+
+Purpose:
+
+- Repair detected-but-bad MANO pose frames after Phase-C2.
+- Target short occlusion-induced failures such as the right hand around frames
+  `625-629`, and isolated infiller jumps such as frame `579`.
+- Use Phase-C2 diagnostics to flag suspicious rows:
+  `mano_orientation_flip_core`, large global rotation delta, raw/smooth global
+  rotation jumps, and large motion-infilled wrist jumps.
+- Bridge tiny good gaps inside a bad span with `PHASE_C2B_BRIDGE_GOOD_GAP_FRAMES`.
+- Interpolate `cam_t_smooth`, `global_orient_smooth`, `hand_pose_smooth`, and
+  `betas_smooth` from the nearest same-track trusted neighbors.
+- Require both trusted neighbors to be within `PHASE_C2B_NEIGHBOR_WINDOW_FRAMES`.
+- Re-run MANO forward for repaired rows instead of moving the mesh approximately.
+
+Outputs:
+
+```text
+stages/phase_c2b_bad_pose_repair/wilor_handresults_phase_c2b_bad_pose_repaired.npz
+stages/phase_c2b_bad_pose_repair/bad_pose_repair_quality.csv
+stages/phase_c2b_bad_pose_repair/bad_pose_repair_summary.json
+```
+
+Important fields:
+
+```text
+pose_repair_bad_pose
+pose_repair_repaired
+pose_repair_reason
+pose_repair_method
+pose_repair_prev_frame
+pose_repair_next_frame
+pose_repair_alpha
+pose_repair_qc_flag
+cam_t_smooth_before_pose_repair
+joints_cam_smooth_before_pose_repair
+vertices_cam_smooth_before_pose_repair
+```
+
+When enabled, Phase-C3 consumes this repaired NPZ instead of the raw Phase-C2
+NPZ.  When disabled, the pipeline keeps the previous Phase-C2 -> Phase-C3 path.
 
 ## Stage C3: MANO Mesh Z-Buffer Visibility
 
@@ -603,6 +762,124 @@ mano_visibility_qc_flag
 
 Status: implemented as a visibility/audit/filter-output node. It feeds the
 optional Stage C4 branch but does not change the main C2 output by itself.
+
+Anchor-locked patch2 branch:
+
+The same script can now be run on the Stage C2a geometry by selecting fields:
+
+```bash
+python local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c3_mano_mesh_visibility.py \
+  --input-npz stages/phase_c2_anchor_locked_depth_patch2/wilor_handresults_phase_c2_anchor_locked_depth_patch2_smooth.npz \
+  --vertices-cam-field vertices_cam_anchor_locked_smooth \
+  --joints-cam-field joints_cam_anchor_locked_smooth \
+  --joints-uv-field joints_uv_anchor_locked_smooth \
+  --output-dir stages/phase_c3_mesh_visibility_anchor_locked_patch2
+```
+
+Current anchor-locked result on `bag_20260622_1548_001`:
+
+```text
+candidates: 1379
+ok: 690
+bad_low_visible_reliable_joints: 400
+bad_low_visible_reliable_joints + warn_low_visible_vertex_ratio: 186
+warn_low_visible_vertex_ratio: 101
+visible_joint_count median: 11
+visible_reliable_joint_count median: 2
+```
+
+This is expected to be strict: low visible reliable count should be treated as a
+filtering/QC signal, not a hard failure of the whole pipeline.
+
+## Stage C2a: Anchor-Locked Patch2 Depth Smooth
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/phase_c2_anchor_locked_depth_patch2.py
+```
+
+Purpose:
+
+- Keep the Phase-C2 smoothed MANO pose/shape.
+- Select one raw WiLoR 2D anchor per hand candidate.
+- Sample FoundationStereo depth in a `2px` radius hand-mask-gated patch around
+  that anchor.
+- Translate the C2 MANO hand so the same semantic MANO anchor projects to the
+  raw 2D anchor.
+- Smooth the selected anchor depth per physical hand track while preserving the
+  raw anchor 2D projection.
+- Skip anchor-lock for rows with `motion_infilled=1`; those rows are already
+  hallucinated by the motion infiller, so their 2D anchors are not trusted for
+  a second depth re-alignment.
+- Reject any anchor-lock result whose projected skeleton is more than `120 px`
+  RMS away from raw WiLoR 2D landmarks.
+
+Anchor policy:
+
+```text
+palm_center -> middle_mcp -> wrist -> index_mcp -> ring_mcp -> pinky_mcp
+```
+
+The first anchor whose `5x5` local depth patch has enough valid SAM-mask pixels
+and acceptable depth span is used.  This stage intentionally skips silhouette
+search; X/Y is controlled by the raw selected anchor, and Z is controlled by the
+masked local FoundationStereo depth.
+
+Outputs:
+
+```text
+stages/phase_c2_anchor_locked_depth_patch2/wilor_handresults_phase_c2_anchor_locked_depth_patch2_smooth.npz
+stages/phase_c2_anchor_locked_depth_patch2/phase_c2_anchor_locked_depth_patch2_quality.csv
+stages/phase_c2_anchor_locked_depth_patch2/phase_c2_anchor_locked_depth_patch2_track_summary.csv
+stages/phase_c2_anchor_locked_depth_patch2/phase_c2_anchor_locked_depth_patch2_summary.json
+stages/phase_c2_anchor_locked_depth_patch2/phase_c2_anchor_locked_depth_patch2_overlay.mp4
+stages/phase_c2_anchor_locked_depth_patch2/phase_c2_anchor_locked_depth_patch2_contact.jpg
+```
+
+Important fields:
+
+```text
+cam_t_anchor_locked
+joints_cam_anchor_locked
+vertices_cam_anchor_locked
+joints_uv_anchor_locked
+cam_t_anchor_locked_smooth
+joints_cam_anchor_locked_smooth
+vertices_cam_anchor_locked_smooth
+joints_uv_anchor_locked_smooth
+anchor_lock_status
+anchor_lock_qc_flag
+anchor_lock_anchor_name
+anchor_lock_anchor_ids
+anchor_lock_anchor_uv
+anchor_lock_anchor_depth_m
+anchor_lock_anchor_depth_smooth_m
+anchor_lock_smooth_delta_z_m
+anchor_lock_trust
+```
+
+Current result on `bag_20260622_1548_001`:
+
+```text
+candidates: 1379
+status: 1296 anchor_lock_smooth_ok, 20 temporal_outlier, 7 no_valid_anchor_depth, 56 motion_infilled_skip_anchor_lock
+anchor selection: 1233 palm_center, 34 middle_mcp, 28 index_mcp, 21 wrist
+orig RMS median: 31.97 px
+anchor-locked smooth RMS median: 20.35 px
+before wrist-Z jump median/p90: 2.8 mm / 11.0 mm
+after wrist-Z jump median/p90: 1.4 mm / 6.6 mm
+```
+
+Interpretation:
+
+- This fixes a large part of the 2D/depth projection offset.
+- It reduces depth jitter, but it does not fix MANO orientation flips.
+- The `563-618` right-hand missing segment remains a motion-infiller segment;
+  Stage C2a now leaves that segment in the infiller geometry instead of
+  re-projecting it from uncertain 2D anchors.
+- The `625-629` right-hand bag-occlusion issue is a pose/orientation problem, not
+  an anchor-depth problem.  It is handled by optional Stage C2b before C3.
 
 ## Stage C4: Visibility-Aware Depth Re-Alignment
 
@@ -679,6 +956,24 @@ qc: 712 ok, 289 bad flags, 213 warn flags
 Status: implemented and QC-gated, but experimental. Do not feed this into
 gripper mapping until visual review shows it helps.
 
+Anchor-locked patch2 branch result on `bag_20260622_1548_001`:
+
+```text
+input: stages/phase_c3_mesh_visibility_anchor_locked_patch2/wilor_handresults_phase_c3_mesh_visibility.npz
+output: stages/phase_c4_visibility_depth_realign_anchor_locked_patch2/
+candidates: 1379
+source: 599 visible_reliable, 517 visible_stable, 187 keep_previous_low_visible_depth
+bad_rms_keep_previous: 76
+kept_previous_total: 263
+median_delta: 15.9 mm
+p95_delta: 53.0 mm
+qc: 922 ok, 77 bad flags, 193 warn flags
+```
+
+This remains an experimental branch.  It should not replace the Stage C2a
+anchor-locked output until its overlay/table-frame behavior is visually better
+than the simpler anchor-lock result.
+
 ## Node-Level QC
 
 Script:
@@ -713,3 +1008,197 @@ Currently checks:
   stabilized depth on several demos.
 - Decide whether Stage C4 visibility-aware re-align helps enough to feed later
   gripper mapping.  It remains experimental and off by default.
+
+## C3 Downstream: Gripper Mapping And IK
+
+C3 is the current boundary between hand tracking/alignment and robot retargeting.
+The downstream stack should consume the repaired C3 NPZ, not the experimental
+C4 branch, unless explicitly testing C4.
+
+Current downstream entry point:
+
+```bash
+cd /home/yannan/workspace/learning-from-video
+bash local_pipelines/egoinfinity_hand_alignment_pipeline/run_alignment_gripper_mapping_ik_backends.sh \
+  /home/yannan/workspace/ros1_docker-main/rosbag_data/human_teaching_videos/bag_20260622_1548_001
+```
+
+Backward-compatible old entry point:
+
+```text
+local_pipelines/egoinfinity_hand_alignment_pipeline/run_alignment_gripper_mapping_pinocchio_ik.sh
+```
+
+Default C3 input:
+
+```text
+stages/phase_c3_mesh_visibility_anchor_locked_patch2_pose_repaired/
+  wilor_handresults_phase_c3_mesh_visibility.npz
+```
+
+Default C3 fields consumed:
+
+```text
+joints_cam_anchor_locked_smooth
+joints_uv_anchor_locked_smooth
+```
+
+Overall downstream structure:
+
+```text
+C3 repaired hand tracking
+  -> Phase-D EgoInfinity pre-IK
+  -> Phase-E gripper-base core CSV
+  -> IK backend A: Pinocchio DLS
+  -> IK backend B: PyRoki
+  -> MuJoCo / 3D debug / replay consumers
+```
+
+### Phase-D EgoInfinity Pre-IK
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_pipeline/phase_d_egoinfinity_preik/build_egoinfinity_preik.py
+```
+
+Purpose:
+
+- Build dense left/right hand trajectories from C3 MANO joints.
+- Construct wrist 6D pose and smooth it.
+- Transform camera-frame hand targets to table frame.
+- Export weak gripper/contact/grasp/push-tuck labels.
+
+Output:
+
+```text
+stages/phase_d_preik_anchor_locked_patch2_pose_repaired/
+  preik_targets.npz
+  hand_features.npz
+  phase_labels.csv
+  phase_labels.html
+```
+
+### Phase-E Piper Gripper-Base CSV
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_pipeline/phase_e_piper_gripper_base_ik/export_phase_d_to_piper_core_csv.py
+```
+
+Purpose:
+
+- Convert Phase-D wrist targets into the legacy Piper core CSV schema.
+- Treat mapped wrist position as the robot `gripper_base` origin.
+- Keep `TCP_OFFSET_XYZ=0,0,0` by default, so this is not the old pinch/TCP
+  offset target.
+
+Output:
+
+```text
+stages/phase_e_piper_gripper_base_ik_input_anchor_locked_patch2_pose_repaired/
+  phase_d_right_gripper_base_core.csv
+  quality_check/phase_d_right_preik_wrist6d_table_3d.html
+  quality_check/phase_d_right_preik_wrist6d_robot_3d.html
+```
+
+This CSV is the shared interface for both IK backends.
+
+### Phase-E Backend A: Pinocchio DLS
+
+Enabled by default:
+
+```bash
+RUN_PINOCCHIO_IK=true
+```
+
+Script called inside `ros1_noetic`:
+
+```text
+/home/yannan/workspace/ros1_docker-main/workspaces/scripts/lfv_simulate_piper_core_gripper_pinocchio.py
+```
+
+Recommended current baseline:
+
+```bash
+IK_MODE=position ORIENTATION_SOURCE=none
+```
+
+Pose mode is wired but should be treated as orientation-debug until the human
+wrist frame to Piper gripper-base frame mapping is stable:
+
+```bash
+IK_MODE=pose ORIENTATION_SOURCE=rot6d
+```
+
+### Phase-F Backend B: PyRoki
+
+Enabled explicitly:
+
+```bash
+RUN_PYROKI_IK=true
+```
+
+Script:
+
+```text
+local_pipelines/egoinfinity_hand_pipeline/phase_f_pyroki_ik_backend/solve_phase_e_pyroki_ik.py
+```
+
+Setup:
+
+```bash
+local_pipelines/egoinfinity_hand_pipeline/phase_f_pyroki_ik_backend/install_pyroki_env.sh \
+  /home/yannan/workspace/.venvs/pyroki
+```
+
+PyRoki consumes the same Phase-E CSV as Pinocchio.  It is currently an
+independent comparison backend, not the default real-robot backend.
+
+Run PyRoki only:
+
+```bash
+RUN_PINOCCHIO_IK=false RUN_PYROKI_IK=true \
+IK_MODE=position ORIENTATION_SOURCE=none \
+bash local_pipelines/egoinfinity_hand_alignment_pipeline/run_alignment_gripper_mapping_ik_backends.sh <session>
+```
+
+Short PyRoki smoke:
+
+```bash
+RUN_PINOCCHIO_IK=false RUN_PYROKI_IK=true \
+PYROKI_MAX_FRAMES=5 PYROKI_STAGE_NAME=phase_f_pyroki_ik_smoke_5f_position_none \
+IK_MODE=position ORIENTATION_SOURCE=none \
+bash local_pipelines/egoinfinity_hand_alignment_pipeline/run_alignment_gripper_mapping_ik_backends.sh <session>
+```
+
+Run both backends on the same targets:
+
+```bash
+RUN_PINOCCHIO_IK=true RUN_PYROKI_IK=true \
+IK_MODE=position ORIENTATION_SOURCE=none \
+bash local_pipelines/egoinfinity_hand_alignment_pipeline/run_alignment_gripper_mapping_ik_backends.sh <session>
+```
+
+Status: integrated as a downstream backend switch.  The hand-stack C0-C3 runner
+does not run IK directly; this separation is intentional so C3 results can be
+frozen and compared across multiple IK backends.
+
+Validated full PyRoki position-only run on `bag_20260622_1548_001`:
+
+```text
+output: stages/phase_f_pyroki_ik_right_gripper_base_absolute_s1_position_none
+frames: 685 / 685 success
+max_pos_error_m: 0.000906
+phase_f_pyroki_ik time: 16.82s
+```
+
+Validated Pinocchio position-only runner check on the same Phase-E CSV:
+
+```text
+output: stages/phase_e_pinocchio_ik_runner_check_position_none_no_render
+frames: 685 / 685 success
+max_pos_error_m: 0.000100
+phase_e_pinocchio_ik time: 0.92s
+```
